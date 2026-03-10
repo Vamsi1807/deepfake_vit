@@ -1,0 +1,63 @@
+# -------------------------
+# Python cache files
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# -------------------------
+# Virtual Environment
+# -------------------------
+venv/
+env/
+.venv/
+
+# -------------------------
+# Model files (trained weights)
+# -------------------------
+models/
+*.pt
+*.pth
+*.h5
+*.ckpt
+
+# -------------------------
+# Extracted features (ViT embeddings)
+# -------------------------
+extracted_features_vit/
+*.npy
+
+# -------------------------
+# Face tracking & cropped data
+# -------------------------
+tracked_faces/
+tracked_faces_celebdf/
+
+# -------------------------
+# Uploaded videos (Streamlit uploads)
+# -------------------------
+uploads/
+
+# -------------------------
+# Logs & temporary files
+# -------------------------
+*.log
+*.tmp
+*.cache
+
+# -------------------------
+# Jupyter checkpoints
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# OS generated files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Streamlit
+# -------------------------
+.streamlit/
