@@ -45,6 +45,7 @@ uploads/
 *.log
 *.tmp
 *.cache
+*.doc
 
 # -------------------------
 # Jupyter checkpoints

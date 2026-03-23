@@ -14,7 +14,7 @@ DATASET_ROOT = BASE_DIR.parent / "DeepFake Detection" / "Dataset" / "CelebDF"
 video_data = load_celebdf(str(DATASET_ROOT))
 NO_FACE_LOG = BASE_DIR / "no_face_videos_celebdf.txt"
 
-MAX_PER_LABEL = 250
+MAX_PER_LABEL = 500
 
 
 def has_saved_frames(video_dir: Path) -> bool:
@@ -76,7 +76,7 @@ for entry in video_data:
 
     for i, frame in enumerate(frames):
         boxes = detect_faces(frame)
-        tracked = tracker.update(boxes)
+        tracked = tracker.update(boxes, frame=frame)
 
         for face_id, box in tracked.items():
             x, y, w, h = box

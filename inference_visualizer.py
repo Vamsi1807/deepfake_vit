@@ -1,6 +1,7 @@
 import os
 import json
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -36,20 +37,32 @@ def configure_gpu():
 # Configure device policy before loading any TF/Keras models.
 configure_gpu()
 
-LSTM_MODEL_PATH = "models/best_lstm_vit.h5"
-lstm_model = load_model(LSTM_MODEL_PATH)
+APP_DIR = Path(__file__).resolve().parent
+LSTM_MODEL_PATH = APP_DIR / "models" / "best_lstm_vit.h5"
+lstm_model = load_model(str(LSTM_MODEL_PATH))
 
 vit_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224-in21k")
 vit_model = TFViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
 
 MAX_SEQ_LENGTH = 30
-FAKE_THRESHOLD = 0.6
+DEFAULT_FAKE_THRESHOLD = 0.6
 SMOOTHING_WINDOW = 5
 MIN_FRAMES_FOR_PREDICTION = 5
 BOX_SMOOTHING_ALPHA = 0.7
 PRESENTATION_MODE = True
 TRACK_HOLD_FRAMES = 3
 SMOOTH_PLAYBACK = True
+MIN_FAKE_CONSECUTIVE_FRAMES = 3
+MIN_REAL_CONSECUTIVE_FRAMES = 2
+MIN_FAKE_SEGMENT_SECONDS = 1.0
+MIN_QUALIFIED_SEGMENTS_FOR_VIDEO_FAKE = 2
+VIDEO_FAKE_SCORE_MARGIN = 0.08
+MIN_SCORE_SAMPLES_FOR_FACE_VERDICT = 4
+MIN_FACE_FRAME_RATIO_FOR_VERDICT = 0.20
+MIN_TOTAL_FAKE_SECONDS_FOR_FACE_VERDICT = 2.0
+MIN_DECISIVE_FACE_FRAME_RATIO = 0.35
+MIN_DECISIVE_FACE_FRAMES = 15
+MIN_DECISIVE_FAKE_FACES_FOR_VIDEO = 2
 
 if PRESENTATION_MODE:
     # Fast profile for demos/live usage.
@@ -63,6 +76,25 @@ else:
     DETECT_EVERY_N_FRAMES = 1
     LSTM_PREDICT_EVERY_N_FRAMES = 1
     INFER_MAX_SECONDS = None
+
+
+def load_fake_threshold():
+    threshold_path = APP_DIR / "models" / "threshold_vit.json"
+    if not threshold_path.exists():
+        print(f"Threshold file not found. Using default threshold {DEFAULT_FAKE_THRESHOLD:.2f}")
+        return DEFAULT_FAKE_THRESHOLD
+    try:
+        with open(threshold_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        threshold = float(payload.get("decision_threshold", DEFAULT_FAKE_THRESHOLD))
+        print(f"Loaded calibrated fake threshold: {threshold:.4f}")
+        return threshold
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Failed to load threshold file ({exc}). Using default threshold {DEFAULT_FAKE_THRESHOLD:.2f}")
+        return DEFAULT_FAKE_THRESHOLD
+
+
+FAKE_THRESHOLD = load_fake_threshold()
 
 
 def build_reason_signals(score, feature_count):
@@ -209,10 +241,10 @@ def process_and_annotate_video(video_path):
         if i % DETECT_EVERY_N_FRAMES == 0:
             boxes = detect_faces(frame)
             boxes = filter_overlapping_boxes(boxes, iou_threshold=0.5)
-            tracker.update(boxes)
+            tracker.update(boxes, frame=frame)
         else:
             # Advance tracker state even when detection is skipped.
-            tracker.update([])
+            tracker.update([], frame=frame)
 
         # Keep recent tracks visible between detection frames to avoid label flicker.
         tracked = {
@@ -257,10 +289,14 @@ def process_and_annotate_video(video_path):
                 predictions[face_id] = {
                     "features": deque(maxlen=MAX_SEQ_LENGTH),
                     "scores": deque(maxlen=SMOOTHING_WINDOW),
+                    "frame_count": 0,
                     "is_fake": False,
+                    "fake_streak": 0,
+                    "real_streak": 0,
                     "active_segment": None,
                 }
 
+            predictions[face_id]["frame_count"] += 1
             predictions[face_id]["features"].append(feat)
 
             if (
@@ -281,9 +317,20 @@ def process_and_annotate_video(video_path):
                 avg_score = sum(predictions[face_id]["scores"]) / len(
                     predictions[face_id]["scores"]
                 )
-                is_fake_now = avg_score > FAKE_THRESHOLD
+                over_threshold = avg_score >= FAKE_THRESHOLD
 
-                if is_fake_now and not predictions[face_id]["is_fake"]:
+                if over_threshold:
+                    predictions[face_id]["fake_streak"] += 1
+                    predictions[face_id]["real_streak"] = 0
+                else:
+                    predictions[face_id]["real_streak"] += 1
+                    predictions[face_id]["fake_streak"] = 0
+
+                if (
+                    over_threshold
+                    and not predictions[face_id]["is_fake"]
+                    and predictions[face_id]["fake_streak"] >= MIN_FAKE_CONSECUTIVE_FRAMES
+                ):
                     predictions[face_id]["active_segment"] = {
                         "face_id": int(face_id),
                         "start_frame": int(i),
@@ -293,7 +340,8 @@ def process_and_annotate_video(video_path):
                             avg_score, len(predictions[face_id]["features"])
                         ),
                     }
-                elif is_fake_now and predictions[face_id]["active_segment"] is not None:
+                    predictions[face_id]["is_fake"] = True
+                elif predictions[face_id]["is_fake"] and predictions[face_id]["active_segment"] is not None:
                     predictions[face_id]["active_segment"]["peak_fake_score"] = float(
                         max(
                             predictions[face_id]["active_segment"]["peak_fake_score"],
@@ -301,15 +349,22 @@ def process_and_annotate_video(video_path):
                         )
                     )
 
-                if (not is_fake_now) and predictions[face_id]["is_fake"]:
+                if (
+                    (not over_threshold)
+                    and predictions[face_id]["is_fake"]
+                    and predictions[face_id]["real_streak"] >= MIN_REAL_CONSECUTIVE_FRAMES
+                ):
                     active = predictions[face_id]["active_segment"]
                     if active is not None:
                         active["end_frame"] = int(i)
                         active["end_time_sec"] = float(i * seconds_per_frame)
-                        analysis_segments.append(active)
+                        duration = active["end_time_sec"] - active["start_time_sec"]
+                        if duration >= MIN_FAKE_SEGMENT_SECONDS:
+                            analysis_segments.append(active)
                         predictions[face_id]["active_segment"] = None
+                    predictions[face_id]["is_fake"] = False
 
-                predictions[face_id]["is_fake"] = is_fake_now
+                is_fake_now = predictions[face_id]["is_fake"]
                 label = "FAKE" if is_fake_now else "REAL"
                 color = (0, 0, 255) if is_fake_now else (0, 255, 0)
             else:
@@ -341,7 +396,9 @@ def process_and_annotate_video(video_path):
             active = state["active_segment"]
             active["end_frame"] = int(len(frames) - 1)
             active["end_time_sec"] = float((len(frames) - 1) * seconds_per_frame)
-            analysis_segments.append(active)
+            duration = active["end_time_sec"] - active["start_time_sec"]
+            if duration >= MIN_FAKE_SEGMENT_SECONDS:
+                analysis_segments.append(active)
 
     if not any_face_detected:
         analysis_path = os.path.splitext(video_path)[0] + "_analysis.json"
@@ -374,22 +431,89 @@ def process_and_annotate_video(video_path):
             "analysis_json_path": analysis_path,
         }
 
+    fake_segments_by_face = {}
+    for segment in analysis_segments:
+        fake_segments_by_face.setdefault(int(segment["face_id"]), []).append(segment)
+
     face_verdicts = {}
     fake_face_ids = []
     for face_id, state in predictions.items():
         scores = list(state["scores"])
         avg_score = float(sum(scores) / len(scores)) if scores else 0.0
-        is_fake = bool(scores and avg_score > FAKE_THRESHOLD)
+        score_samples = int(len(scores))
+        frame_count = int(state.get("frame_count", 0))
+        frame_ratio = frame_count / max(float(len(frames)), 1.0)
+        segments = fake_segments_by_face.get(int(face_id), [])
+        qualified_segments = int(len(segments))
+        total_fake_seconds = float(
+            sum(
+                max(
+                    0.0,
+                    float(segment.get("end_time_sec", 0.0))
+                    - float(segment.get("start_time_sec", 0.0)),
+                )
+                for segment in segments
+            )
+        )
+        has_valid_fake_segment = qualified_segments > 0
+        has_reliable_signal = (
+            score_samples >= MIN_SCORE_SAMPLES_FOR_FACE_VERDICT
+            and frame_ratio >= MIN_FACE_FRAME_RATIO_FOR_VERDICT
+            and total_fake_seconds >= MIN_TOTAL_FAKE_SECONDS_FOR_FACE_VERDICT
+        )
+        passes_segment_rule = qualified_segments >= MIN_QUALIFIED_SEGMENTS_FOR_VIDEO_FAKE
+        passes_score_rule = avg_score >= (FAKE_THRESHOLD + VIDEO_FAKE_SCORE_MARGIN)
+        is_fake = bool(
+            has_valid_fake_segment
+            and has_reliable_signal
+            and (passes_segment_rule or passes_score_rule)
+        )
         face_verdicts[int(face_id)] = {
             "verdict": "FAKE" if is_fake else "REAL",
             "avg_fake_score": avg_score,
-            "score_samples": int(len(scores)),
+            "score_samples": score_samples,
+            "frames_seen": frame_count,
+            "frame_ratio": float(frame_ratio),
+            "qualified_fake_segments": qualified_segments,
+            "total_fake_seconds": total_fake_seconds,
         }
         if is_fake:
             fake_face_ids.append(int(face_id))
     fake_face_ids.sort()
+
+    decisive_fake_face_ids = []
+    for face_id in fake_face_ids:
+        verdict = face_verdicts.get(face_id, {})
+        frames_seen = int(verdict.get("frames_seen", 0))
+        frame_ratio = float(verdict.get("frame_ratio", 0.0))
+        if (
+            frame_ratio >= MIN_DECISIVE_FACE_FRAME_RATIO
+            or frames_seen >= MIN_DECISIVE_FACE_FRAMES
+        ):
+            decisive_fake_face_ids.append(int(face_id))
+    decisive_fake_face_ids.sort()
+
+    primary_face_id = None
+    if face_verdicts:
+        primary_face_id = int(
+            max(
+                face_verdicts.keys(),
+                key=lambda k: int(face_verdicts[k].get("frames_seen", 0)),
+            )
+        )
+
+    primary_face_is_fake = (
+        primary_face_id is not None and primary_face_id in decisive_fake_face_ids
+    )
     detected_face_ids = sorted(int(face_id) for face_id in seen_face_ids)
-    video_verdict = "FAKE" if fake_face_ids else "REAL"
+    video_verdict = (
+        "FAKE"
+        if (
+            primary_face_is_fake
+            or len(decisive_fake_face_ids) >= MIN_DECISIVE_FAKE_FACES_FOR_VIDEO
+        )
+        else "REAL"
+    )
 
     analysis_path = os.path.splitext(video_path)[0] + "_analysis.json"
     analysis_payload = {
@@ -400,9 +524,19 @@ def process_and_annotate_video(video_path):
         "inference_fps": float(output_fps),
         "detected_face_ids": detected_face_ids,
         "video_verdict": video_verdict,
-        "fake_face_ids": fake_face_ids,
+        "fake_face_ids": decisive_fake_face_ids,
+        "candidate_fake_face_ids": fake_face_ids,
+        "primary_face_id": primary_face_id,
         "face_verdicts": face_verdicts,
         "fake_threshold": float(FAKE_THRESHOLD),
+        "min_fake_consecutive_frames": int(MIN_FAKE_CONSECUTIVE_FRAMES),
+        "min_fake_segment_seconds": float(MIN_FAKE_SEGMENT_SECONDS),
+        "min_score_samples_for_face_verdict": int(MIN_SCORE_SAMPLES_FOR_FACE_VERDICT),
+        "min_face_frame_ratio_for_verdict": float(MIN_FACE_FRAME_RATIO_FOR_VERDICT),
+        "min_total_fake_seconds_for_face_verdict": float(MIN_TOTAL_FAKE_SECONDS_FOR_FACE_VERDICT),
+        "min_decisive_face_frame_ratio": float(MIN_DECISIVE_FACE_FRAME_RATIO),
+        "min_decisive_face_frames": int(MIN_DECISIVE_FACE_FRAMES),
+        "min_decisive_fake_faces_for_video": int(MIN_DECISIVE_FAKE_FACES_FOR_VIDEO),
         "note": "Reason signals are model-based indicators, not forensic proof.",
         "fake_segments": analysis_segments,
     }
@@ -412,8 +546,8 @@ def process_and_annotate_video(video_path):
     print(f"Annotated output saved to: {output_path}")
     print(f"Video verdict: {video_verdict}")
     print(f"Detected face IDs: {detected_face_ids}")
-    if fake_face_ids:
-        print(f"Fake face IDs: {fake_face_ids}")
+    if decisive_fake_face_ids:
+        print(f"Fake face IDs: {decisive_fake_face_ids}")
     else:
         print("Fake face IDs: []")
     print(f"Analysis JSON saved to: {analysis_path}")

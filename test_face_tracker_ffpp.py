@@ -14,7 +14,7 @@ DATASET_ROOT = BASE_DIR.parent / "DeepFake Detection" / "Dataset" / "FaceForensi
 video_data = load_faceforensics(str(DATASET_ROOT))
 NO_FACE_LOG = BASE_DIR / "no_face_videos_ffpp.txt"
 
-MAX_PER_LABEL = 275
+MAX_PER_LABEL = 450
 
 
 def has_saved_frames(video_dir: Path) -> bool:
@@ -74,7 +74,7 @@ for entry in video_data:
 
     for i, frame in enumerate(frames):
         boxes = detect_faces(frame)
-        tracked = tracker.update(boxes)
+        tracked = tracker.update(boxes, frame=frame)
 
         for face_id, box in tracked.items():
             x, y, w, h = box
